@@ -1,305 +1,332 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#
+# Method — text feature offline augmentation
+#
+# Core idea:
+#   Use a co-purchase graph to split neighbors into:
+#     - Substitute: high similarity, per-seed >= P85
+#     - Complement: low similarity, per-seed <= P40
+#   Use a soft conceptor (SVD) to extract residuals orthogonal to the substitute subspace,
+#   then inject them into the seed vector to expand semantic coverage.
+#
+# Usage:
+#   Update Config paths and SEED_MAX, then run.
+#   Example SEED_MAX values depend on dataset size
 
 import json
-import logging
-import os
-from dataclasses import dataclass
-
 import numpy as np
+import os
+import logging
 from tqdm import tqdm
+from dataclasses import dataclass
+from typing import Tuple, Dict, List
 
 
-# =============================================================================
-# 1) Configuration (anonymized / double-blind)
-# =============================================================================
+# ==========================
+# 1. Core configuration
+# ==========================
 @dataclass
 class Config:
-    # --- Paths (use neutral, non-identifying names) ---
-    EMB_PATH: str = "data/embeddings.npy"          # input embedding matrix (N x D)
-    RELATED_PATH: str = "data/neighbor_map.json"   # item->neighbors map
-    OUT_PATH: str = "data/embeddings_out.npy"      # output embedding matrix
+    # --- File paths ---
+    EMB_PATH: str = "data/text_feat.npy"
+    RELATED_PATH: str = "data/related_by_id.json"
+    OUT_PATH: str = "text_feat_enhanced.npy"
 
-    # --- Target index range (inclusive) ---
+    # --- Range control ---
     SEED_MIN: int = 0
-    SEED_MAX: int = 7049
+    SEED_MAX: int = 0  # Set to dataset size - 1
 
-    # --- Optional automatic threshold calibration ---
-    AUTO_CALIBRATE: bool = True
-    CALIBRATION_SAMPLES: int = 6000
+    # --- Per-seed percentile thresholds (aligns with similarity_islands.py) ---
+    # Each seed ranks neighbors locally to avoid global distribution bias.
+    # STRONG_PERCENTILE=85 -> top 15% as substitutes
+    # WEAK_PERCENTILE=40  -> bottom 40% as complement candidates
+    STRONG_PERCENTILE: float = 95.0
+    WEAK_PERCENTILE: float = 45.0
 
-    # Percentiles used to infer “high-confidence” and “mid-confidence” similarity cutoffs
-    HIGH_CONF_PERCENTILE: float = 95.0
-    MID_CONF_PERCENTILE: float = 60.0
+    # --- Complement similarity lower bound ---
+    # After percentile split, drop extremely low-similarity neighbors (noise).
+    # Retained for backward compatibility; current flow applies soft weighting.
+    WEAK_SIM_MIN: float = 0.20
 
-    # Fallback thresholds (used if calibration fails)
-    HIGH_CONF_THRESHOLD: float = 0.85
-    MID_CONF_THRESHOLD_LOW: float = 0.55
+    # --- Soft conceptor parameters ---
+    # Larger aperture -> more aggressive filtering of substitute subspace.
+    # Smaller aperture -> keep more complement signal.
+    # Recommended range: 8.0 ~ 20.0
+    CONCEPTOR_APERTURE: float = 12.0
 
-    # --- Algorithm hyperparameters (kept generic) ---
-    # Controls the softness of singular-value attenuation
-    APERTURE: float = 12.0
-    # Base injection factor for the residual signal
-    ALPHA_BASE: float = 0.20
-    # Sensitivity factor for uncertainty-adaptive scaling
-    UNCERTAINTY_SCALE: float = 1.0
-
-    # --- Safety / performance knobs (neutral) ---
-    MAX_NEIGHBORS_PER_SEED_IN_CALIB: int = 50
+    # --- Gap constraint for alpha projection ---
+    # Keep local substitute-complement gap from collapsing after injection.
+    # Constraint: gap_after >= GAP_KEEP_RATIO * gap_before
+    GAP_KEEP_RATIO: float = 0.60
+    MARGIN_EPS: float = 1e-8
 
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - [Pipeline] - %(levelname)s - %(message)s",
+    format='%(asctime)s - [Method] - %(levelname)s - %(message)s'
 )
 
 
-# =============================================================================
-# 2) Core algorithm (anonymized / double-blind)
-# =============================================================================
-class ResidualEnhancer:
-    """
-    A generic embedding refinement routine:
-    - Build a core matrix from (seed + high-confidence neighbors)
-    - Compute a soft subspace filter using SVD singular values
-    - Extract residual signals from mid-confidence neighbors after soft projection
-    - Orthogonalize residual against the seed vector
-    - Blend residual back into seed with uncertainty-adaptive scaling
-    """
+# ==========================
+# 2. Algorithm implementation
+# ==========================
+class AdvancedPaCE:
+    def __init__(self, config: Config):
+        self.cfg = config
+        self._gamma_sq_inv = config.CONCEPTOR_APERTURE ** (-2)
 
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
+    def _soft_conceptor_weights(self, s_values: np.ndarray) -> np.ndarray:
+        """
+        Soft conceptor weights: w_i = s_i^2 / (s_i^2 + gamma^{-2})
+        Larger s_i -> weight closer to 1 -> stronger suppression of that direction.
+        Smaller s_i -> weight closer to 0 -> direction preserved in residuals.
+        """
+        s2 = s_values ** 2
+        return s2 / (s2 + self._gamma_sq_inv + 1e-12)
 
-    def _soft_sv_weights(self, s_values: np.ndarray) -> np.ndarray:
-        gamma_sq_inv = self.cfg.APERTURE ** (-2)
-        return (s_values**2) / (s_values**2 + gamma_sq_inv + 1e-12)
-
-    @staticmethod
-    def _entropy_of_singular_values(s_values: np.ndarray) -> float:
-        if s_values.size == 0:
-            return 0.0
-        p = s_values / (np.sum(s_values) + 1e-12)
-        return float(-np.sum(p * np.log(p + 1e-12)))
-
-    def enhance(
+    def process_vector(
         self,
         seed_vec: np.ndarray,
-        high_conf_vecs: np.ndarray,
-        mid_conf_vecs: np.ndarray,
+        strong_vecs: np.ndarray,
+        weak_vecs: np.ndarray,
     ) -> np.ndarray:
-        # Build the core matrix: seed plus high-confidence neighbors (if any)
-        if high_conf_vecs.size > 0:
-            core_matrix = np.vstack([seed_vec[None, :], high_conf_vecs])
-        else:
-            core_matrix = seed_vec[None, :]
+        """
+        Core enhancement logic returning final_residual.
 
-        # SVD for a low-rank basis; guard against numerical failures
+        Steps:
+        1) Build the core subspace from seed + substitutes (SVD)
+        2) Filter complements with a soft conceptor to remove the core subspace
+        3) Mean residual + orthogonalize against the seed direction
+        4) Injection scale is derived from the local gap constraint in the main loop
+        """
+        # Step 1: Build the core matrix (seed + substitute neighbors)
+        core_matrix = (
+            np.vstack([seed_vec[None, :], strong_vecs])
+            if len(strong_vecs) > 0
+            else seed_vec[None, :]
+        )
+
         try:
-            _, s_vals, vt = np.linalg.svd(core_matrix, full_matrices=False)
+            _, S, Vt = np.linalg.svd(core_matrix, full_matrices=False)
         except np.linalg.LinAlgError:
-            return seed_vec
+            return np.zeros_like(seed_vec)
 
-        # Soft attenuation of principal directions
-        w = self._soft_sv_weights(s_vals)
+        soft_weights = self._soft_conceptor_weights(S)
 
-        # Project mid-confidence neighbors into the softened subspace and take residuals
-        coeffs = mid_conf_vecs @ vt.T
-        soft_proj = (coeffs * w[None, :]) @ vt
-        residuals = mid_conf_vecs - soft_proj
+        # Step 2: Soft conceptor filtering
+        coeffs = weak_vecs @ Vt.T                                  # (n_weak, rank)
+        soft_projections = (coeffs * soft_weights[None, :]) @ Vt   # (n_weak, D)
+        residuals = weak_vecs - soft_projections                    # (n_weak, D)
 
-        # Aggregate residual signal
+        # Step 3: Mean residual + orthogonalization
         mean_residual = np.mean(residuals, axis=0)
-
-        # Orthogonalize residual against the seed direction
         proj_on_seed = np.dot(mean_residual, seed_vec) * seed_vec
-        residual_orth = mean_residual - proj_on_seed
+        final_residual = mean_residual - proj_on_seed
 
-        # Uncertainty-adaptive mixing based on singular-value entropy
-        ent = self._entropy_of_singular_values(s_vals)
-        alpha = self.cfg.ALPHA_BASE * (1.0 + self.cfg.UNCERTAINTY_SCALE * ent)
-
-        enhanced = seed_vec + alpha * residual_orth
-        enhanced = enhanced / (np.linalg.norm(enhanced) + 1e-12)
-        return enhanced
+        return final_residual
 
 
-# =============================================================================
-# 3) Utilities (anonymized / double-blind)
-# =============================================================================
-def load_inputs(cfg: Config) -> tuple[np.ndarray, dict[int, list[int]]]:
-    """
-    Load and normalize embedding matrix; load neighbor mapping from JSON.
-    Neighbor JSON format: { "<int_id>": [<int_neighbor_id>, ...], ... }
-    """
+# ==========================
+# 3. Data loading
+# ==========================
+def load_data(cfg: Config) -> Tuple[np.ndarray, Dict[int, List[int]]]:
     if not os.path.exists(cfg.EMB_PATH):
-        raise FileNotFoundError(f"Embedding file not found: {cfg.EMB_PATH}")
-    logging.info(f"Loading embeddings: {cfg.EMB_PATH}")
+        raise FileNotFoundError(f"Feature file not found: {cfg.EMB_PATH}")
+    logging.info(f"Loading embeddings: {cfg.EMB_PATH} ...")
     emb = np.load(cfg.EMB_PATH)
 
-    # Row-wise L2 normalization
-    emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
+    # Normalize to unit sphere (for cosine similarity)
+    norm = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12
+    emb = emb / norm
 
     if not os.path.exists(cfg.RELATED_PATH):
-        raise FileNotFoundError(f"Neighbor map not found: {cfg.RELATED_PATH}")
+        raise FileNotFoundError(f"Relation file not found: {cfg.RELATED_PATH}")
 
-    logging.info(f"Loading neighbor map: {cfg.RELATED_PATH}")
+    related_map: Dict[int, List[int]] = {}
     with open(cfg.RELATED_PATH, "r", encoding="utf-8") as f:
-        raw = json.load(f)
+        raw_data = json.load(f)
+        for k, v in raw_data.items():
+            if not v:
+                continue
+            try:
+                sid = int(k)
+                neighs = [int(x) for x in v]
+                related_map[sid] = neighs
+            except ValueError:
+                continue
 
-    neighbor_map: dict[int, list[int]] = {}
-    for k, v in raw.items():
-        if not v:
-            continue
-        try:
-            sid = int(k)
-            neighs = [int(x) for x in v]
-            neighbor_map[sid] = neighs
-        except (ValueError, TypeError):
-            continue
-
-    return emb, neighbor_map
-
-
-def auto_calibrate(cfg: Config, emb: np.ndarray, neighbor_map: dict[int, list[int]]) -> tuple[float, float]:
-    """
-    Auto-calibrate cosine similarity thresholds by sampling neighbor similarities and
-    taking configured percentiles as cutoffs.
-    """
-    logging.info("Running automatic threshold calibration...")
-
-    keys = list(neighbor_map.keys())
-    if not keys:
-        logging.warning("Calibration failed: empty neighbor map. Using fallback thresholds.")
-        return cfg.HIGH_CONF_THRESHOLD, cfg.MID_CONF_THRESHOLD_LOW
-
-    if len(keys) > cfg.CALIBRATION_SAMPLES:
-        sampled = np.random.choice(keys, cfg.CALIBRATION_SAMPLES, replace=False)
-    else:
-        sampled = keys
-
-    sim_scores: list[float] = []
-    n_items = emb.shape[0]
-
-    for sid in sampled:
-        sid = int(sid)
-        if sid >= n_items:
-            continue
-
-        neighs = [n for n in neighbor_map.get(sid, []) if 0 <= n < n_items and n != sid]
-        if not neighs:
-            continue
-
-        # Bound per-seed workload to avoid outliers dominating runtime
-        if len(neighs) > cfg.MAX_NEIGHBORS_PER_SEED_IN_CALIB:
-            neighs = np.random.choice(neighs, cfg.MAX_NEIGHBORS_PER_SEED_IN_CALIB, replace=False)
-
-        seed_vec = emb[sid]
-        neigh_vecs = emb[np.array(neighs, dtype=np.int64)]
-        sims = neigh_vecs @ seed_vec
-        sim_scores.extend(sims.tolist())
-
-    if not sim_scores:
-        logging.warning("Calibration failed: no similarities computed. Using fallback thresholds.")
-        return cfg.HIGH_CONF_THRESHOLD, cfg.MID_CONF_THRESHOLD_LOW
-
-    sims_arr = np.asarray(sim_scores, dtype=np.float64)
-    high_th = float(np.percentile(sims_arr, cfg.HIGH_CONF_PERCENTILE))
-    mid_th = float(np.percentile(sims_arr, cfg.MID_CONF_PERCENTILE))
-
-    # Safety: ensure high-confidence cutoff is strictly greater than mid-confidence cutoff
-    if high_th <= mid_th:
-        logging.warning("Calibration anomaly: high_th <= mid_th; applying minimal separation.")
-        high_th = mid_th + 0.1
-
-    logging.info(f"Calibration done | #samples={len(sims_arr)}")
-    logging.info(f"  -> P{int(cfg.HIGH_CONF_PERCENTILE)} (high): {high_th:.4f}")
-    logging.info(f"  -> P{int(cfg.MID_CONF_PERCENTILE)}  (mid) : {mid_th:.4f}")
-
-    return high_th, mid_th
+    logging.info(f"Loaded: {len(emb)} items, {len(related_map)} items have neighbors")
+    return emb, related_map
 
 
-def preview_rows(mat: np.ndarray, count: int = 10) -> None:
-    """Print a short preview of the first `count` rows (first 10 dims each)."""
-    logging.info("=" * 60)
-    logging.info(f"PREVIEW: First {min(count, mat.shape[0])} output vectors")
-    logging.info("=" * 60)
-
-    np.set_printoptions(precision=4, suppress=True, linewidth=120)
-    limit = min(count, mat.shape[0])
-
-    for i in range(limit):
-        vec = mat[i]
-        print(f"Row {i:05d} | Norm: {np.linalg.norm(vec):.4f} | First 10 dims: {vec[:10]} ...")
-    print()
-
-
-# =============================================================================
-# 4) Main routine (anonymized / double-blind)
-# =============================================================================
-def main() -> None:
+# ==========================
+# 4. Main
+# ==========================
+def main():
     cfg = Config()
+    # Fixed safety cap (kept as code constant, not a tunable config parameter).
+    ALPHA_HARD_CAP = 0.35
 
-    # Load inputs
-    emb, neighbor_map = load_inputs(cfg)
-    n_items, d_dim = emb.shape
+    full_emb, related_graph = load_data(cfg)
+    N_items, D_dim = full_emb.shape
 
-    # Determine thresholds (auto-calibrated or fallback)
-    high_th = cfg.HIGH_CONF_THRESHOLD
-    mid_th = cfg.MID_CONF_THRESHOLD_LOW
-    if cfg.AUTO_CALIBRATE:
-        high_th, mid_th = auto_calibrate(cfg, emb, neighbor_map)
+    pace = AdvancedPaCE(cfg)
 
-    enhancer = ResidualEnhancer(cfg)
-
-    # Prepare output buffer
     target_count = cfg.SEED_MAX - cfg.SEED_MIN + 1
-    out = np.zeros((target_count, d_dim), dtype=emb.dtype)
+    out_mat = np.zeros((target_count, D_dim), dtype=full_emb.dtype)
 
-    logging.info(f"Processing range [{cfg.SEED_MIN}, {cfg.SEED_MAX}]")
-    logging.info(f"Using thresholds: high >= {high_th:.4f}, mid >= {mid_th:.4f}")
+    logging.info(
+        "Per-seed percentile strategy | "
+        f"Substitute >= P{cfg.STRONG_PERCENTILE} (top {100 - cfg.STRONG_PERCENTILE:.0f}%) | "
+        f"Complement <= P{cfg.WEAK_PERCENTILE} & sim >= {cfg.WEAK_SIM_MIN} | "
+        f"Aperture={cfg.CONCEPTOR_APERTURE} | "
+        "Alpha=derived_by_gap_constraint | "
+        f"GAP_KEEP_RATIO={cfg.GAP_KEEP_RATIO} | "
+        f"AlphaHardCap={ALPHA_HARD_CAP}"
+    )
 
-    stats = {"enhanced": 0, "kept_no_neighbor": 0, "kept_no_mid": 0}
+    stats = {"enhanced": 0, "skipped_no_neighbor": 0, "skipped_no_weak": 0, "margin_limited": 0}
+    diag = {
+        "n_strong": [],
+        "n_weak": [],           # filtered complement count
+        "n_weak_filtered": [],  # dropped by WEAK_SIM_MIN
+        "sim_strong": [],
+        "sim_weak": [],
+        "alpha": [],
+        "gap_before": [],
+        "gap_target": [],
+    }
 
-    for i in tqdm(range(target_count), desc="Embedding Refinement"):
+    for i in tqdm(range(target_count), desc="Embedding Augmentation"):
         seed_id = cfg.SEED_MIN + i
-        if seed_id >= n_items:
+        if seed_id >= N_items:
             continue
 
-        seed_vec = emb[seed_id]
-        neighs = neighbor_map.get(seed_id, [])
-        valid = [n for n in neighs if 0 <= n < n_items and n != seed_id]
+        original_vec = full_emb[seed_id]
+        neighbors = related_graph.get(seed_id, [])
+        valid_neighbors = [n for n in neighbors if 0 <= n < N_items and n != seed_id]
 
-        if not valid:
-            out[i] = seed_vec
-            stats["kept_no_neighbor"] += 1
+        if not valid_neighbors:
+            out_mat[i] = original_vec
+            stats["skipped_no_neighbor"] += 1
             continue
 
-        neigh_vecs = emb[np.array(valid, dtype=np.int64)]
-        sims = neigh_vecs @ seed_vec
+        neigh_vecs = full_emb[valid_neighbors]
+        sims = np.dot(neigh_vecs, original_vec)
 
-        # Partition neighbors by similarity bands
-        mask_high = sims >= high_th
-        mask_mid = (sims < high_th) & (sims >= mid_th)
+        # Per-seed percentile split
+        strong_cut = float(np.percentile(sims, cfg.STRONG_PERCENTILE))
+        weak_cut = float(np.percentile(sims, cfg.WEAK_PERCENTILE))
+        mask_strong = sims >= strong_cut
+        # Complement: percentile lower bound AND absolute similarity lower bound
+        mask_weak_pct = sims <= weak_cut
+        mask_weak = mask_weak_pct & (sims >= cfg.WEAK_SIM_MIN)
 
-        high_vecs = neigh_vecs[mask_high]
-        mid_vecs = neigh_vecs[mask_mid]
+        strong_vecs = neigh_vecs[mask_strong]
+        weak_vecs = neigh_vecs[mask_weak]
 
-        if mid_vecs.shape[0] == 0:
-            out[i] = seed_vec
-            stats["kept_no_mid"] += 1
+        n_filtered = int(mask_weak_pct.sum()) - int(mask_weak.sum())
+
+        if len(weak_vecs) == 0:
+            out_mat[i] = original_vec
+            stats["skipped_no_weak"] += 1
             continue
 
-        out[i] = enhancer.enhance(seed_vec, high_vecs, mid_vecs)
+        final_residual = pace.process_vector(original_vec, strong_vecs, weak_vecs)
+
+        # Gap-constrained alpha projection to avoid gap collapse
+        gap_before = float(sims[mask_strong].mean() - sims[mask_weak].mean())
+        gap_target = cfg.GAP_KEEP_RATIO * gap_before
+
+        # Constraint-derived alpha (no extra injection hyper-parameter)
+        alpha_final = 0.0
+        margin_limited = False
+        if gap_before > 0.0:
+            mu_strong = np.mean(strong_vecs, axis=0)
+            mu_weak = np.mean(weak_vecs, axis=0)
+            d_gap = float(np.dot(mu_strong - mu_weak, final_residual))
+            alpha_margin = 1.0
+            if d_gap < 0.0:
+                alpha_margin = max((gap_before - gap_target) / (-d_gap + cfg.MARGIN_EPS), 0.0)
+            alpha_final = alpha_margin
+            margin_limited = d_gap < 0.0 and alpha_final < 1.0
+
+        if margin_limited:
+            stats["margin_limited"] += 1
+
+        alpha_final = min(alpha_final, ALPHA_HARD_CAP)
+
+        enhanced_vec = original_vec + alpha_final * final_residual
+        enhanced_vec = enhanced_vec / (np.linalg.norm(enhanced_vec) + 1e-12)
+
+        out_mat[i] = enhanced_vec
         stats["enhanced"] += 1
 
-    # Preview
-    preview_rows(out, count=10)
+        diag["n_strong"].append(int(mask_strong.sum()))
+        diag["n_weak"].append(int(mask_weak.sum()))
+        diag["n_weak_filtered"].append(n_filtered)
+        diag["sim_strong"].append(float(sims[mask_strong].mean()))
+        diag["sim_weak"].append(float(sims[mask_weak].mean()))
+        diag["alpha"].append(alpha_final)
+        diag["gap_before"].append(gap_before)
+        diag["gap_target"].append(gap_target)
 
-    # Save
-    logging.info(f"Done. Stats: {stats}")
-    logging.info(f"Enhancement ratio: {stats['enhanced'] / max(target_count, 1):.2%}")
-    np.save(cfg.OUT_PATH, out)
-    logging.info(f"Saved output to: {cfg.OUT_PATH}")
+    # ---- Output stats ----
+    total = target_count
+    logging.info("=" * 65)
+    logging.info("Enhancement coverage summary")
+    logging.info("=" * 65)
+    logging.info(f"  Total seeds:           {total}")
+    logging.info(f"  Enhanced:              {stats['enhanced']}  ({stats['enhanced'] / total:.2%})")
+    logging.info(f"  Skipped - no neighbors: {stats['skipped_no_neighbor']}  ({stats['skipped_no_neighbor'] / total:.2%})")
+    logging.info(f"  Skipped - no complements: {stats['skipped_no_weak']}  ({stats['skipped_no_weak'] / total:.2%})")
+    logging.info(f"  Gap constraint active (alpha<1): {stats['margin_limited']}  ({stats['margin_limited'] / total:.2%})")
+
+    if diag["n_strong"]:
+        arr_ns = np.array(diag["n_strong"])
+        arr_nw = np.array(diag["n_weak"])
+        arr_nf = np.array(diag["n_weak_filtered"])
+        arr_ss = np.array(diag["sim_strong"])
+        arr_sw = np.array(diag["sim_weak"])
+        arr_al = np.array(diag["alpha"])
+        arr_gb = np.array(diag["gap_before"])
+        arr_gt = np.array(diag["gap_target"])
+
+        logging.info("-" * 65)
+        logging.info("Substitute distribution:")
+        logging.info(f"  Count: mean={arr_ns.mean():.1f}, median={np.median(arr_ns):.1f}, "
+                     f"min={arr_ns.min()}, max={arr_ns.max()}")
+        logging.info(f"  Similarity: mean={arr_ss.mean():.4f}, std={arr_ss.std():.4f}")
+
+        logging.info("Complement distribution (filtered):")
+        logging.info(f"  Count: mean={arr_nw.mean():.1f}, median={np.median(arr_nw):.1f}, "
+                     f"min={arr_nw.min()}, max={arr_nw.max()}")
+        logging.info(f"  Similarity: mean={arr_sw.mean():.4f}, std={arr_sw.std():.4f}")
+        logging.info(f"  Dropped neighbors by WEAK_SIM_MIN={cfg.WEAK_SIM_MIN}: "
+                     f"mean={arr_nf.mean():.1f}/seed, total={arr_nf.sum()}")
+
+        gap = arr_ss.mean() - arr_sw.mean()
+        logging.info(f"Mean gap (sub - comp): {gap:.4f}")
+        logging.info("  (Larger gap => clearer substitute/complement separation)")
+        logging.info(f"Gap target: mean={arr_gt.mean():.4f} (orig mean={arr_gb.mean():.4f}, keep_ratio={cfg.GAP_KEEP_RATIO})")
+
+        logging.info("Constraint-derived alpha distribution:")
+        logging.info(f"  mean={arr_al.mean():.4f}, std={arr_al.std():.4f}, "
+                     f"min={arr_al.min():.4f}, max={arr_al.max():.4f}")
+
+    logging.info("=" * 65)
+
+    # ---- Preview first 10 ----
+    np.set_printoptions(precision=4, suppress=True, linewidth=120)
+    logging.info("PREVIEW: first 10 enhanced vectors")
+    for i in range(min(10, out_mat.shape[0])):
+        vec = out_mat[i]
+        print(f"ID {i:05d} | Norm: {np.linalg.norm(vec):.4f} | first 10 dims: {vec[:10]} ...")
+
+    # ---- Save ----
+    np.save(cfg.OUT_PATH, out_mat)
+    logging.info(f"Saved results to: {cfg.OUT_PATH}")
 
 
 if __name__ == "__main__":
