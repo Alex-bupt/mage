@@ -35,23 +35,26 @@ See [docs/DATA_FORMAT.md](docs/DATA_FORMAT.md). The default root is `main/data/`
 main/data/clothing/
   clothing.inter
   image_feat.npy
+  text_feat_full.npy
   text_feat_raw.npy
   text_feat.npy
   related_by_id.json
   p2b_map_filtered.json
 ```
 
-The local source folder does not include the full visual/text feature matrices. Obtain the processed inputs separately and retain the exact ID mapping and train/validation/test split. Source upload does not reproduce the paper's result tables.
+Feature matrices are distributed separately from the source. Retain the exact ID mapping and train/validation/test split. Expanded text catalogs contain extra neighbor items for offline augmentation; they are not direct Stage-2 inputs. Source upload does not reproduce the paper's result tables.
 
 ## Stage 1: augment text features
 
 From the repository root:
 
 ```bash
-python stage1_process.py --emb-path main/data/clothing/text_feat_raw.npy --related-path main/data/clothing/related_by_id.json --out-path main/data/clothing/text_feat.npy
+python stage1_process.py --emb-path main/data/clothing/text_feat_full.npy --related-path main/data/clothing/related_by_id.json --out-path main/data/clothing/text_feat.npy --seed-max 23032
 ```
 
-The CLI processes all feature rows by default, preserving row IDs. `--seed-max` is an inclusive last row for an explicit prefix. Keep raw and augmented files separate. The supplied augmentation defaults are substitute percentile 95, complement percentile 45, aperture 12, gap retention 0.60 and an injection cap of 0.35. The analysis script separately defaults to percentiles 95/40; record these choices when comparing results.
+For an expanded catalog, **set `--seed-max` to the last recommendation item ID**: Baby 7049, Sports 18356, Clothing 23032, Electronics 63000. The full matrix supplies neighbor embeddings, while only the verified seed prefix is enhanced and exported. Omitting this option processes the entire catalog, which is unsuitable for the supplied Stage-2 interaction files. Verify the prefix against `i_id_mapping_full.csv` and `i_id_mapping.csv` before running. Keep the full matrix as `text_feat_full.npy`, the unmodified seed rows as `text_feat_raw.npy`, and the enhanced seed rows as `text_feat.npy`.
+
+The confirmed parameters are shared by all four datasets: substitute percentile 95, complement percentile 45, minimum weak similarity 0.20, aperture 12, gap retention 0.60, margin epsilon 1e-8 and a fixed injection cap of 0.35. The current code applies the minimum weak similarity as a hard floor; the inherited comment mentioning soft weighting is stale. The analysis script separately defaults to percentiles 95/40; record these choices when comparing results.
 
 ## Stage 2: train
 
@@ -85,11 +88,15 @@ The model caches feature KNN graphs (`*_adj_*.pt`) in each dataset directory. If
 ```bash
 python main/src/run_similarity_islands.py --datasets clothing --project_root main
 python tests/smoke_test.py
+python tests/test_runtime_compat.py
+python tests/test_feature_validation.py
 ```
 
 Similarity analysis reads `text_feat_raw.npy`, `image_feat.npy` and `p2b_map_filtered.json` under `main/data/<dataset>/`; results go to `main/results/`. Use the raw text features when analyzing the pre-augmentation geometry. Case-study visualization additionally requires an explicit checkpoint and case JSON; use `python main/src/visualize_embeddings.py --help` in the full environment.
 
-The smoke check needs only NumPy. It compiles all Python sources, exercises shared path resolution from different working directories, checks the augmentation residual on synthetic vectors, and checks the training and augmentation CLI help. It does not train a model or validate GPU execution. Full training and plotting require the dependencies and data above.
+The smoke check needs only NumPy. It compiles Python sources, exercises shared path resolution from different working directories, checks augmentation residuals and CLI help. The runtime compatibility test additionally needs PyTorch and checks graph normalization and ranking metrics. Feature validation rejects expanded catalogs before allocating embeddings or quadratic KNN matrices.
+
+Local integration validation completed one CPU epoch, validation and test for each of the four datasets using real interaction subsets (32 users each), supplied image features, newly augmented text features and restricted real P2B edges. This used Python 3.11, PyTorch 2.5.1+cpu, torchvision 0.20.1+cpu, NumPy 1.26.4, pandas 2.2.3 and SciPy 1.14.1, with reduced embedding size/depth. These are software checks, not full-dataset runs or paper metrics. Native PyTorch degree aggregation removes the extra `torch_scatter` dependency; metric code also supports modern NumPy without `np.float`.
 
 ## Provenance
 
