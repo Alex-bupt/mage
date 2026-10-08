@@ -18,7 +18,6 @@ import json
 import numpy as np
 import os
 import logging
-from tqdm import tqdm
 from dataclasses import dataclass
 from typing import Tuple, Dict, List
 
@@ -163,13 +162,18 @@ def load_data(cfg: Config) -> Tuple[np.ndarray, Dict[int, List[int]]]:
 # ==========================
 # 4. Main
 # ==========================
-def main():
-    cfg = Config()
+def main(cfg=None):
+    from tqdm import tqdm
+    cfg = Config() if cfg is None else cfg
     # Fixed safety cap (kept as code constant, not a tunable config parameter).
     ALPHA_HARD_CAP = 0.35
 
     full_emb, related_graph = load_data(cfg)
     N_items, D_dim = full_emb.shape
+    if cfg.SEED_MAX < 0:
+        cfg.SEED_MAX = N_items - 1
+    if not 0 <= cfg.SEED_MIN <= cfg.SEED_MAX < N_items:
+        raise ValueError('Seed range must lie inside the feature matrix')
 
     pace = AdvancedPaCE(cfg)
 
@@ -330,4 +334,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description='Offline text-feature augmentation')
+    parser.add_argument('--emb-path', required=True)
+    parser.add_argument('--related-path', required=True)
+    parser.add_argument('--out-path', required=True)
+    parser.add_argument('--seed-max', type=int, default=-1, help='Inclusive last row; -1 processes all rows')
+    args = parser.parse_args()
+    if os.path.abspath(args.emb_path) == os.path.abspath(args.out_path):
+        parser.error('Use a distinct output path to preserve raw features')
+    output_parent = os.path.dirname(os.path.abspath(args.out_path))
+    os.makedirs(output_parent, exist_ok=True)
+    main(Config(EMB_PATH=args.emb_path, RELATED_PATH=args.related_path, OUT_PATH=args.out_path, SEED_MAX=args.seed_max))

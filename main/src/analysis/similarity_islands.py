@@ -10,8 +10,8 @@ import numpy as np
 from sklearn.manifold import TSNE
 
 
-DEFAULT_DATASETS = ("dataset_a", "dataset_b", "dataset_c")
-STRONG_PERCENTILE = 85
+DEFAULT_DATASETS = ("baby", "sports", "clothing", "elec")
+STRONG_PERCENTILE = 95
 WEAK_PERCENTILE = 40
 
 
@@ -359,7 +359,7 @@ def run_similarity_islands_analysis(
         datasets = DEFAULT_DATASETS
 
     data_root = project_root / "data"
-    graph_root = project_root / "src" / "data"
+    graph_root = data_root
     results_dir = project_root / "results"
 
     all_stats: List[SimilarityStats] = []
@@ -419,7 +419,7 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         nargs="+",
         default=DEFAULT_DATASETS,
-        help="Datasets to analyze, e.g. dataset_a dataset_b",
+        help="Datasets to analyze, e.g. baby sports clothing",
     )
     parser.add_argument("--seed_sample_count", type=int, default=200, help="Number of seed items for t-SNE")
     parser.add_argument("--top_k", type=int, default=5, help="Top-k substitutes/complements per seed for t-SNE")

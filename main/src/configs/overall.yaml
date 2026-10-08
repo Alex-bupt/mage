@@ -4,8 +4,8 @@ use_gpu: True
 seed: [999]
 
 # multi-modal raw features
-data_path: '/data/'
-save_path: '/src/saved/'
+data_path: 'data'  # Relative to main/, or an absolute data root
+save_path: 'saved/'
 
 inter_splitting_label: 'x_label'
 filter_out_cod_start_users: True
@@ -37,7 +37,7 @@ ITEM_ID_FIELD: item_id:token
 TIME_FIELD: timestamp:float
 field_separator: "\t"
 
-inter_file: "/root/autodl-tmp/MAGE-main/src/data/MAGE/baby/inter.json"
+inter_file: null  # Graph intersections are generated in each dataset directory
 add_self_loop: False
 self_loop_weight: 1.0
 

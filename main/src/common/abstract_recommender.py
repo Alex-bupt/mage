@@ -3,6 +3,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+from utils.paths import dataset_path as resolve_dataset_path
 
 
 class AbstractRecommender(nn.Module):
@@ -87,7 +88,7 @@ class GeneralRecommender(AbstractRecommender):
         # load encoded features here
         self.v_feat, self.t_feat = None, None
         if not config['end2end'] and config['is_multimodal_model']:
-            dataset_path = os.path.abspath("/root/autodl-tmp/GUME-main/data/" + config['dataset'])
+            dataset_path = resolve_dataset_path(config)
             # if file exist?
             v_feat_file_path = os.path.join(dataset_path, config['vision_feature_file'])
             t_feat_file_path = os.path.join(dataset_path, config['text_feature_file'])
@@ -96,4 +97,5 @@ class GeneralRecommender(AbstractRecommender):
             if os.path.isfile(t_feat_file_path):
                 self.t_feat = torch.from_numpy(np.load(t_feat_file_path, allow_pickle=True)).type(torch.FloatTensor).to(self.device)
 
-            assert self.v_feat is not None or self.t_feat is not None, 'Features all NONE'
+            if self.v_feat is None or self.t_feat is None:
+                raise FileNotFoundError('MAGE requires both image and text features in ' + dataset_path)

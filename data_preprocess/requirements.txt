@@ -1,0 +1,2 @@
+# Optional Qwen endpoint clients, separate from the legacy training environment.
+openai>=1.40.0,<2

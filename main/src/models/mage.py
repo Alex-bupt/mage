@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from common.abstract_recommender import GeneralRecommender
 from utils.utils import build_sim, build_knn_normalized_graph
+from utils.paths import dataset_path
 from collections import defaultdict
 import json
 import numpy as np
@@ -89,7 +90,8 @@ class MAGE(GeneralRecommender):
         self.extended_text_user = nn.Embedding(self.n_users, self.embedding_dim)
         nn.init.xavier_uniform_(self.extended_text_user.weight)
 
-        self.dataset_path = os.path.abspath(os.getcwd() + config['data_path'] + config['dataset'])
+        self.dataset_path = dataset_path(config)
+        self.p2b_weight = float(config['p2b_weight'])
 
         self.bilinear_fusion = BiLinearGate(self.embedding_dim)
 
@@ -200,7 +202,7 @@ class MAGE(GeneralRecommender):
 
     def add_edge(self, inter, p2b_map=None):
         MAX_P2B_K = 20
-        P2B_WEIGHT = 0.7
+        P2B_WEIGHT = self.p2b_weight
         sim_rows = []
         sim_cols = []
         sim_values = []

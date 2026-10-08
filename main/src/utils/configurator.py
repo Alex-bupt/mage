@@ -63,8 +63,7 @@ class Config(object):
         file_config_dict = dict()
         file_list = []
         # get dataset and model files
-        cur_dir = os.getcwd()
-        cur_dir = os.path.join(cur_dir, 'configs')
+        cur_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'configs')
         file_list.append(os.path.join(cur_dir, "overall.yaml"))
         file_list.append(os.path.join(cur_dir, "dataset", "{}.yaml".format(config_dict['dataset'])))
         file_list.append(os.path.join(cur_dir, "model", "{}.yaml".format(config_dict['model'].upper())))

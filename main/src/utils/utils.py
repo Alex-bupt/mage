@@ -125,8 +125,13 @@ def compute_normalized_laplacian(adj):
 
 
 def build_sim(context):
-    context_norm = context.div(torch.norm(context, p=2, dim=-1, keepdim=True))
+    # Guard against zero-norm rows (e.g. missing image features encoded as all-zero vectors).
+    # Without this clamp, division by zero will introduce NaN into the KNN graph.
+    norm = torch.norm(context, p=2, dim=-1, keepdim=True).clamp_min(1e-12)
+    context_norm = context / norm
+    context_norm = torch.nan_to_num(context_norm, nan=0.0, posinf=0.0, neginf=0.0)
     sim = torch.mm(context_norm, context_norm.transpose(1, 0))
+    sim = torch.nan_to_num(sim, nan=0.0, posinf=0.0, neginf=0.0)
     return sim
 
 def get_sparse_laplacian(edge_index, edge_weight, num_nodes, normalization='none'):

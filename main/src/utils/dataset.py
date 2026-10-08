@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from utils.data_utils import (ImageResize, ImagePad, image_to_tensor, load_decompress_img_from_lmdb_value)
 import lmdb
+from utils.paths import dataset_path
 
 class RecDataset(object):
     def __init__(self, config, df=None):
@@ -14,7 +15,7 @@ class RecDataset(object):
 
         # data path & files
         self.dataset_name = config['dataset']
-        self.dataset_path = os.path.abspath('/root/autodl-tmp/GUME-main/data/'+self.dataset_name)
+        self.dataset_path = dataset_path(config)
 
         # dataframe
         self.uid_field = self.config['USER_ID_FIELD']
