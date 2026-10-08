@@ -29,6 +29,22 @@ Choose a PyTorch build compatible with your CUDA installation. Qwen endpoint cli
 
 ## Prepare data
 
+**[Download prepared datasets from Google Drive](https://drive.google.com/file/d/1EYtXqrTKnv2WqVvIsBezJ7qLKPnteg4f/view?usp=sharing)** — Baby, Sports, Clothing and Electronics.
+
+The archive `MAGE_datasets_2026-10-08.zip` is approximately **1.88 GB** (1,882,496,634 bytes). It includes interaction splits and hard-test subsets, ID mappings, visual features, enhanced training text features, raw seed text features, expanded text catalogs, offline relation graphs and online complementary edges. The text features have already been augmented using the shared Stage-1 parameters below.
+
+Extract the archive to obtain `MAGE_datasets/`, then point the training loader at that directory:
+
+```bash
+python main/src/main.py --model mage --dataset clothing --config main/src/configs/experiments/clothing_local.yaml --data-path /absolute/path/to/MAGE_datasets
+```
+
+Use the supplied `text_feat.npy` directly for training; rerun Stage 1 only when changing the augmentation settings. The included `README.txt` explains the package layout, and `SHA256SUMS.txt` provides per-file checksums. The release archive was read back and its contents verified locally before upload. Its SHA-256 is:
+
+```text
+8412c252d01efbcadc48101b3d3634191318e554d11219a93119b6253fb0651a
+```
+
 See [docs/DATA_FORMAT.md](docs/DATA_FORMAT.md). The default root is `main/data/`, independent of the launch directory. A dataset directory contains aligned interaction splits, visual/text features and optional complementary edges:
 
 ```text
