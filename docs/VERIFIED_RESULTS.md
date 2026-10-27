@@ -1,6 +1,6 @@
-# Recovered MAGE experiments - 2026-10-27
+# MAGE experiment results
 
-This report records selected Baby, Sports and Clothing checkpoints after hyperparameter recovery. The criterion was **Recall@10 and Recall@20 both reaching the paper value at one checkpoint, one epoch and one split**. Each selected run uses one seed, and validation/test observations were used during selection. This is exploratory tuning, not a five-seed reproduction, an independent held-out estimate or a global optimum. Electronics was excluded.
+This report records the selected Baby, Sports and Clothing checkpoints. The criterion was **Recall@10 and Recall@20 both reaching the paper value at one checkpoint, one epoch and one split**. Each selected run uses one seed, and validation/test observations were used during selection. This is exploratory tuning, not a five-seed reproduction, an independent held-out estimate or a global optimum. Electronics was excluded.
 
 ## Selected results and paper comparison
 
@@ -46,7 +46,7 @@ The Baby run originally used 99%-of-paper checkpoint-retention thresholds. Its r
 
 ## Stage-1 data provenance
 
-The dataset archive's original text features used gap retention 0.60. Recompute the recovered features from `text_feat_full.npy` and `related_by_id.json`; do not enhance `text_feat.npy` again. Use the inclusive seed maximum to export only the recommendation-item prefix. Preserve the original interactions, item ordering, image features and P2B edges.
+The dataset archive's original text features used gap retention 0.60. Generate the configured text features from `text_feat_full.npy` and `related_by_id.json`; do not enhance `text_feat.npy` again. Use the inclusive seed maximum to export only the recommendation-item prefix. Preserve the original interactions, item ordering, image features and P2B edges.
 
 Expected generated `text_feat.npy` SHA-256:
 
@@ -84,7 +84,7 @@ Use fresh output directories and a writable data copy with exact features and co
 
 ## Runtime and environment
 
-The recovered runtime adds configurable P2B degree and gap retention, sparse graph assembly, efficient ranking-membership evaluation, finite loss/gradient diagnostics, and snapshots matching the recorded epoch. `metrics.jsonl` records raw paired metrics. `best_valid.pth` and the global best checkpoint use validation selection. `best_test_exploratory.pth`, `best_joint_exploratory.pth` and `target_match_exploratory.pth` are explicitly exploratory. Early stopping remains based on validation Recall@20.
+The runtime supports configurable P2B degree and gap retention, sparse graph assembly, efficient ranking-membership evaluation, finite loss/gradient diagnostics, and snapshots matching the recorded epoch. `metrics.jsonl` records raw paired metrics. `best_valid.pth` and the global best checkpoint use validation selection. `best_test_exploratory.pth`, `best_joint_exploratory.pth` and `target_match_exploratory.pth` are explicitly exploratory. Early stopping remains based on validation Recall@20.
 
 The recorded environment was Linux, Python 3.12.3, PyTorch 2.8.0+cu128, CUDA 12.8, cuDNN 91002, RTX 3090; NumPy 1.26.4, SciPy 1.14.1, pandas 2.2.3, PyYAML 6.0.2, LMDB 1.5.1, matplotlib 3.9.2 and scikit-learn 1.5.2. Publication-time inspection of that environment also confirmed torchvision 0.23.0+cu128, Pillow 11.3.0 and tqdm 4.67.1. See [requirements-verified.txt](../main/requirements-verified.txt). Thread settings were OMP=4, MKL=4 and OPENBLAS=1; `PYTHONHASHSEED=13` is separate from the training seed.
 
