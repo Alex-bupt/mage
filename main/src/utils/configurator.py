@@ -72,6 +72,15 @@ class Config(object):
             if os.path.isfile(file):
                 with open(file, 'r', encoding='utf-8') as f:
                     file_config_dict.update(yaml.load(f.read(), Loader=self._build_yaml_loader()))
+        # Model files may provide defaults selected by --dataset. Explicit
+        # --config / CLI values are applied later in __init__ and retain priority.
+        dataset_overrides = file_config_dict.pop('dataset_overrides', {})
+        if not isinstance(dataset_overrides, dict):
+            raise ValueError('dataset_overrides must be a YAML mapping')
+        selected = dataset_overrides.get(config_dict['dataset'], {})
+        if not isinstance(selected, dict):
+            raise ValueError('dataset_overrides[{}] must be a YAML mapping'.format(config_dict['dataset']))
+        file_config_dict.update(selected)
         return file_config_dict
 
     def _build_yaml_loader(self):

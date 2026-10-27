@@ -4,6 +4,22 @@ import argparse
 os.environ['NUMEXPR_MAX_THREADS'] = '48'
 
 
+def load_yaml_overrides(handle):
+    """Load safe YAML while recognizing exponent-only floats such as 1e-05."""
+    import re
+    import yaml
+
+    class FloatSafeLoader(yaml.SafeLoader):
+        pass
+
+    FloatSafeLoader.add_implicit_resolver(
+        'tag:yaml.org,2002:float',
+        re.compile(r'^[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)$'),
+        list('-+0123456789'),
+    )
+    return yaml.load(handle, Loader=FloatSafeLoader)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', '-m', type=str, default='mage', help='name of models')
@@ -20,11 +36,10 @@ if __name__ == '__main__':
     }
 
     args = parser.parse_args()
-    import yaml
     from utils.quick_start import quick_start
     if args.config:
         with open(args.config, encoding='utf-8') as handle:
-            overrides = yaml.safe_load(handle) or {}
+            overrides = load_yaml_overrides(handle) or {}
         if not isinstance(overrides, dict):
             raise ValueError('--config must contain a YAML mapping')
         config_dict.update(overrides)

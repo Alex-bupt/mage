@@ -5,6 +5,8 @@ r"""
 
 import os
 import itertools
+import json
+import math
 import torch
 import torch.optim as optim
 from torch.nn.utils.clip_grad import clip_grad_norm_
@@ -84,7 +86,7 @@ class Trainer(AbstractTrainer):
         tmp_dd = {}
         for j, k in list(itertools.product(config['metrics'], config['topk'])):
             tmp_dd[f'{j.lower()}@{k}'] = 0.0
-        self.best_valid_score = -1
+        self.best_valid_score = -float('inf') if self.valid_metric_bigger else float('inf')
         self.best_valid_result = tmp_dd
         self.best_test_upon_valid = tmp_dd
         self.train_loss_dict = dict()
@@ -101,6 +103,137 @@ class Trainer(AbstractTrainer):
 
         self.item_tensor = None
         self.tot_item_num = None
+        self.run_dir = self._option('run_dir', self._option('checkpoint_dir', 'saved'))
+        os.makedirs(self.run_dir, exist_ok=True)
+        metrics_file = self._option('metric_jsonl', 'metrics.jsonl')
+        self.metric_jsonl = metrics_file if os.path.isabs(metrics_file) else os.path.join(self.run_dir, metrics_file)
+        os.makedirs(os.path.dirname(os.path.abspath(self.metric_jsonl)), exist_ok=True)
+        self.min_epochs = int(self._option('min_epochs', 0))
+        self.grad_sample_batches = max(0, int(self._option('grad_sample_batches', 2)))
+        self.best_valid = None
+        self.best_test_exploratory = None
+        self.best_joint_exploratory = None
+        self.target_match_exploratory = None
+        self.first_target_match = None
+        self.epochs_completed = 0
+        self.epoch_diagnostics = {}
+        self.gradient_history = []
+        self._best_valid_state = None
+
+    def _option(self, name, default):
+        value = self.config[name] if name in self.config else None
+        return default if value is None else value
+
+    def _synchronize(self):
+        if torch.device(self.device).type == 'cuda':
+            torch.cuda.synchronize(self.device)
+
+    @staticmethod
+    def _write_json(path, value):
+        temporary = str(path) + '.tmp'
+        with open(temporary, 'w', encoding='utf-8') as handle:
+            json.dump(value, handle, indent=2, allow_nan=False, default=str)
+        os.replace(temporary, path)
+
+    def _gradient_sample(self, batch_idx):
+        # Sample before clipping. All parameter norms also expose disconnected branches.
+        norms = {}
+        squared = []
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if parameter.grad is None:
+                norms[name] = None
+                continue
+            gradient = parameter.grad.detach()
+            if gradient.is_sparse:
+                gradient = gradient.coalesce().values()
+            norm = gradient.float().norm(2)
+            squared.append(norm.square())
+            norms[name] = float(norm.item())
+        total = float(torch.stack(squared).sum().sqrt().item()) if squared else 0.0
+        components = {}
+        for name, value in getattr(self.model, 'last_loss_components', {}).items():
+            components[name] = float(value.detach().item() if torch.is_tensor(value) else value)
+        return {'batch': batch_idx, 'total_norm': total, 'parameter_norms': norms,
+                'loss_components': components}
+
+    def _checkpoint(self, filename, metadata, state):
+        path = os.path.join(self.run_dir, filename)
+        temporary = path + '.tmp'
+        torch.save({'state_dict': state, **metadata}, temporary)
+        os.replace(temporary, path)
+
+    def _record_evaluation(self, epoch_idx, valid_result, test_result, update_flag, saved):
+        paired = {'epoch': epoch_idx, 'epoch_number': epoch_idx + 1,
+                  'valid': dict(valid_result), 'test': dict(test_result)}
+        pending = []
+        if update_flag:
+            self.best_valid = dict(paired, selection='validation', checkpoint='best_valid.pth')
+            self.best_valid_result = dict(valid_result)
+            self.best_test_upon_valid = dict(test_result)
+            pending.append(('best_valid.pth', self.best_valid))
+        if test_result and (self.best_test_exploratory is None or
+                test_result['recall@20'] > self.best_test_exploratory['test']['recall@20']):
+            self.best_test_exploratory = dict(paired, selection='test_recall20_exploratory',
+                                             checkpoint='best_test_exploratory.pth')
+            pending.append(('best_test_exploratory.pth', self.best_test_exploratory))
+        target10 = self._option('target_recall10', None)
+        target20 = self._option('target_recall20', None)
+        if target10 is not None and target20 is not None:
+            target10, target20 = float(target10), float(target20)
+            if target10 <= 0 or target20 <= 0:
+                raise ValueError('Recall targets must be positive.')
+            candidates = []
+            for split, metrics in [('valid', valid_result), ('test', test_result)]:
+                r10, r20 = metrics.get('recall@10', -1), metrics.get('recall@20', -1)
+                if math.isfinite(r10) and math.isfinite(r20) and r10 >= 0 and r20 >= 0:
+                    candidates.append((min(r10 / target10, r20 / target20), split))
+            # Retain the strongest paired Recall result even before the target
+            # is met. Maximizing R20 alone can discard the strongest R10/R20 pair.
+            if candidates:
+                joint_score, joint_split = max(candidates, key=lambda candidate: candidate[0])
+                if self.best_joint_exploratory is None or joint_score > self.best_joint_exploratory['minimum_target_ratio']:
+                    self.best_joint_exploratory = dict(
+                        paired, split=joint_split, selection='joint_recall_exploratory',
+                        target_recall10=target10, target_recall20=target20,
+                        minimum_target_ratio=joint_score, checkpoint='best_joint_exploratory.pth')
+                    pending.append(('best_joint_exploratory.pth', self.best_joint_exploratory))
+            candidates = [(score, split) for score, split in candidates if score >= 1.0]
+            if candidates:
+                score, split = max(candidates, key=lambda candidate: candidate[0])
+                candidate = dict(paired, split=split, selection='target_match_exploratory',
+                                 target_recall10=target10, target_recall20=target20,
+                                 minimum_target_ratio=score, checkpoint='target_match_exploratory.pth')
+                if self.first_target_match is None:
+                    # A historical event; the retained target checkpoint can later
+                    # move to a better epoch and must not be attributed to this one.
+                    self.first_target_match = {key: value for key, value in candidate.items()
+                                               if key != 'checkpoint'}
+                    self.first_target_match['checkpoint_retained'] = False
+                if self.target_match_exploratory is None or score > self.target_match_exploratory['minimum_target_ratio']:
+                    self.target_match_exploratory = candidate
+                    pending.append(('target_match_exploratory.pth', candidate))
+        if pending:
+            # Clone once; a later optimizer step must never mutate the selected epoch.
+            state = {name: tensor.detach().cpu().clone() for name, tensor in self.model.state_dict().items()}
+            if update_flag:
+                self._best_valid_state = state
+            if saved:
+                for filename, metadata in pending:
+                    self._checkpoint(filename, metadata, state)
+
+    def run_result(self):
+        return {'selection_policy': 'validation; test and target maxima are exploratory',
+                'epoch_index_base': 0, 'best_valid': self.best_valid,
+                'best_test_exploratory': self.best_test_exploratory,
+                'best_joint_exploratory': self.best_joint_exploratory,
+                'target_match_exploratory': self.target_match_exploratory,
+                'first_target_match': self.first_target_match,
+                'epochs_completed': self.epochs_completed,
+                'gradient_summary': self.gradient_history,
+                'metric_jsonl': os.path.abspath(self.metric_jsonl),
+                'run_dir': os.path.abspath(self.run_dir)}
 
     def _build_optimizer(self):
         r"""Init the Optimizer
@@ -135,6 +268,7 @@ class Trainer(AbstractTrainer):
             multiple parts and the model return these multiple parts loss instead of the sum of loss, It will return a
             tuple which includes the sum of loss in each part.
         """
+        self.epoch_diagnostics = {'gradient_samples': [], 'batches': 0}
         if not self.req_training:
             return 0.0, []
         self.model.train()
@@ -152,9 +286,11 @@ class Trainer(AbstractTrainer):
                 loss = losses
                 total_loss = losses.item() if total_loss is None else total_loss + losses.item()
             if self._check_nan(loss):
-                self.logger.info('Loss is nan at epoch: {}, batch index: {}. Exiting.'.format(epoch_idx, batch_idx))
-                return loss, torch.tensor(0.0)
+                raise FloatingPointError('Nonfinite loss at epoch {}, batch {}'.format(epoch_idx, batch_idx))
             loss.backward()
+            if batch_idx < self.grad_sample_batches:
+                self.epoch_diagnostics['gradient_samples'].append(self._gradient_sample(batch_idx))
+            self.epoch_diagnostics['batches'] += 1
             if self.clip_grad_norm:
                 clip_grad_norm_(self.model.parameters(), **self.clip_grad_norm)
             self.optimizer.step()
@@ -179,7 +315,7 @@ class Trainer(AbstractTrainer):
         return valid_score, valid_result
 
     def _check_nan(self, loss):
-        if torch.isnan(loss):
+        if not torch.isfinite(loss).all():
             #raise ValueError('Training loss is nan')
             return True
 
@@ -192,71 +328,61 @@ class Trainer(AbstractTrainer):
         return train_loss_output + ']'
 
     def fit(self, train_data, valid_data=None, test_data=None, saved=False, verbose=True):
-        r"""Train the model based on the train data and the valid data.
-
-        Args:
-            train_data (DataLoader): the train data
-            valid_data (DataLoader, optional): the valid data, default: None.
-                                               If it's None, the early_stopping is invalid.
-            test_data (DataLoader, optional): None
-            verbose (bool, optional): whether to write training and evaluation information to logger, default: True
-            saved (bool, optional): whether to save the model parameters, default: True
-
-        Returns:
-             (float, dict): best valid score and best valid result. If valid_data is None, it returns (-1, None)
-        """
+        """Train with validation early stopping and retain paired, auditable results."""
+        # Each trainer represents one run; quick_start allocates independent directories.
+        with open(self.metric_jsonl, 'w', encoding='utf-8'):
+            pass
         for epoch_idx in range(self.start_epoch, self.epochs):
-            # train
+            self._synchronize()
             training_start_time = time()
             self.model.pre_epoch_processing()
             train_loss, _ = self._train_epoch(train_data, epoch_idx)
-            if torch.is_tensor(train_loss):
-                # get nan loss
-                break
-            for param_group in self.optimizer.param_groups:
-               self.logger.info('======lr: ' + str(param_group['lr']))
             self.lr_scheduler.step()
-
             self.train_loss_dict[epoch_idx] = sum(train_loss) if isinstance(train_loss, tuple) else train_loss
-            training_end_time = time()
-            train_loss_output = self._generate_train_loss_output(epoch_idx, training_start_time, training_end_time, train_loss)
             post_info = self.model.post_epoch_processing()
+            self._synchronize()
+            training_end_time = time()
+            self.epochs_completed = epoch_idx + 1
+            samples = self.epoch_diagnostics.get('gradient_samples', [])
+            summary = {'epoch': epoch_idx, 'sample_count': len(samples),
+                       'total_norm_mean': sum(s['total_norm'] for s in samples) / len(samples) if samples else None,
+                       'total_norm_max': max((s['total_norm'] for s in samples), default=None)}
+            self.gradient_history.append(summary)
+            record = {'epoch': epoch_idx, 'epoch_number': epoch_idx + 1,
+                      'loss': train_loss, 'train_seconds': training_end_time - training_start_time,
+                      'learning_rates': [group['lr'] for group in self.optimizer.param_groups],
+                      **self.epoch_diagnostics}
             if verbose:
-                self.logger.info(train_loss_output)
+                self.logger.info(self._generate_train_loss_output(epoch_idx, training_start_time, training_end_time, train_loss))
                 if post_info is not None:
                     self.logger.info(post_info)
-
-            # eval: To ensure the test result is the best model under validation data, set self.eval_step == 1
-            if (epoch_idx + 1) % self.eval_step == 0:
+            stop_flag = False
+            if valid_data is not None and (epoch_idx + 1) % self.eval_step == 0:
+                self._synchronize()
                 valid_start_time = time()
                 valid_score, valid_result = self._valid_epoch(valid_data)
+                test_result = self.evaluate(test_data) if test_data is not None else {}
+                self._synchronize()
                 self.best_valid_score, self.cur_step, stop_flag, update_flag = early_stopping(
                     valid_score, self.best_valid_score, self.cur_step,
                     max_step=self.stopping_step, bigger=self.valid_metric_bigger)
-                valid_end_time = time()
-                valid_score_output = "epoch %d evaluating [time: %.2fs, valid_score: %f]" % \
-                                     (epoch_idx, valid_end_time - valid_start_time, valid_score)
-                valid_result_output = 'valid result: \n' + dict2str(valid_result)
-                # test
-                _, test_result = self._valid_epoch(test_data)
+                record.update(valid=dict(valid_result), test=dict(test_result),
+                              evaluation_seconds=time() - valid_start_time, best_valid_updated=update_flag)
+                self._record_evaluation(epoch_idx, valid_result, test_result, update_flag, saved)
                 if verbose:
-                    self.logger.info(valid_score_output)
-                    self.logger.info(valid_result_output)
-                    self.logger.info('test result: \n' + dict2str(test_result))
-                if update_flag:
-                    update_output = '██ ' + self.config['model'] + '--Best validation results updated!!!'
-                    if verbose:
-                        self.logger.info(update_output)
-                    self.best_valid_result = valid_result
-                    self.best_test_upon_valid = test_result
-                    
-
-                if stop_flag:
-                    stop_output = '+++++Finished training, best eval result in epoch %d' % \
-                                  (epoch_idx - self.cur_step * self.eval_step)
-                    if verbose:
-                        self.logger.info(stop_output)
-                    break
+                    self.logger.info('valid result: ' + dict2str(valid_result))
+                    self.logger.info('test result: ' + dict2str(test_result))
+                stop_flag = stop_flag and self.epochs_completed >= self.min_epochs
+            with open(self.metric_jsonl, 'a', encoding='utf-8') as handle:
+                handle.write(json.dumps(record, allow_nan=False) + '\n')
+            self._write_json(os.path.join(self.run_dir, 'run_result.json'), self.run_result())
+            if stop_flag:
+                if verbose:
+                    self.logger.info('Finished training; best validation epoch: %s', self.best_valid['epoch'])
+                break
+        # Leave the live model at the selected epoch, including when saved=False.
+        if self._best_valid_state is not None:
+            self.model.load_state_dict(self._best_valid_state)
         return self.best_valid_score, self.best_valid_result, self.best_test_upon_valid
 
 

@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 from utils.metrics import metrics_dict
+from utils.eval_membership import set_hit_matrix
 from torch.nn.utils.rnn import pad_sequence
 from utils.utils import get_local_time
 
@@ -83,10 +84,7 @@ class TopKEvaluator(object):
             x_df.to_csv(file_path, sep='\t', index=False)
         assert len(pos_len_list) == len(topk_index)
         # if recom right?
-        bool_rec_matrix = []
-        for m, n in zip(pos_items, topk_index):
-            bool_rec_matrix.append([True if i in m else False for i in n])
-        bool_rec_matrix = np.asarray(bool_rec_matrix)
+        bool_rec_matrix = set_hit_matrix(pos_items, topk_index)
 
         # get metrics
         metric_dict = {}
@@ -94,7 +92,9 @@ class TopKEvaluator(object):
         for metric, value in zip(self.metrics, result_list):
             for k in self.topk:
                 key = '{}@{}'.format(metric, k)
-                metric_dict[key] = round(value[k - 1], 4)
+                # Keep numerical precision for selection and target comparisons.
+                # dict2str still prints the historical four-decimal presentation.
+                metric_dict[key] = float(value[k - 1])
         return metric_dict
 
     def _check_args(self):

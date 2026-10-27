@@ -1,0 +1,43 @@
+# Verified clothing single-seed configuration (2026-10-27).
+# Stage 1: use --gap-keep-ratio 0.4. Stage 2 reads prepared features.
+# Explicit CLI options take precedence. run_dir=null creates a fresh run directory.
+# Targets are the paper Recall@10/20 values; selected valid/test results are exploratory.
+embedding_size: 64
+n_layers: 1
+n_ui_layers: 3
+knn_k: 10
+p2b_weight: 0.2
+max_p2b_k: 15
+bm_loss: 0.01
+bm_temp: 0.2
+um_loss: 0.01
+um_temp: 0.2
+vt_loss: 0.1
+reg_weight_1: 1.0e-05
+reg_weight_2: 0.1
+learning_rate: 0.001
+learning_rate_scheduler: [0.96, 50]
+seed: [13]
+epochs: 500
+stopping_step: 60
+min_epochs: 80
+train_batch_size: 8192
+eval_batch_size: 4096
+learner: "adam"
+weight_decay: 0.0
+eval_step: 1
+training_neg_sample_num: 1
+use_neg_sampling: true
+use_full_sampling: false
+grad_sample_batches: 1
+metrics: ["Recall", "NDCG", "Precision", "MAP"]
+topk: [5, 10, 20, 50]
+valid_metric: "Recall@20"
+save_recommended_topk: false
+gap_keep_ratio: 0.4
+visual_user_graph: "shared_text"
+explicit_visual_graph: "raw_knn"
+target_recall10: 0.0738
+target_recall20: 0.1088
+run_dir: null
+checkpoint_dir: "saved/verified"

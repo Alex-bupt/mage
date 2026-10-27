@@ -1,0 +1,15 @@
+# Python 3.12.3. Install the matching PyTorch/CUDA build separately first:
+# python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+# These direct dependency versions were read from the experiment environment.
+# This is not a complete transitive dependency lock.
+torch==2.8.0
+torchvision==0.23.0
+numpy==1.26.4
+pandas==2.2.3
+scipy==1.14.1
+PyYAML==6.0.2
+lmdb==1.5.1
+Pillow==11.3.0
+tqdm==4.67.1
+matplotlib==3.9.2
+scikit-learn==1.5.2

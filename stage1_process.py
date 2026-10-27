@@ -165,6 +165,8 @@ def load_data(cfg: Config) -> Tuple[np.ndarray, Dict[int, List[int]]]:
 def main(cfg=None):
     from tqdm import tqdm
     cfg = Config() if cfg is None else cfg
+    if not 0.0 <= cfg.GAP_KEEP_RATIO <= 1.0:
+        raise ValueError('GAP_KEEP_RATIO must be between 0 and 1 inclusive')
     # Fixed safety cap (kept as code constant, not a tunable config parameter).
     ALPHA_HARD_CAP = 0.35
 
@@ -340,9 +342,14 @@ if __name__ == "__main__":
     parser.add_argument('--related-path', required=True)
     parser.add_argument('--out-path', required=True)
     parser.add_argument('--seed-max', type=int, default=-1, help='Inclusive last row; -1 processes all rows')
+    parser.add_argument('--gap-keep-ratio', type=float, default=Config.GAP_KEEP_RATIO,
+                        help='Fraction of the local substitute-complement gap to retain (0 to 1)')
     args = parser.parse_args()
+    if not 0.0 <= args.gap_keep_ratio <= 1.0:
+        parser.error('--gap-keep-ratio must be between 0 and 1 inclusive')
     if os.path.abspath(args.emb_path) == os.path.abspath(args.out_path):
         parser.error('Use a distinct output path to preserve raw features')
     output_parent = os.path.dirname(os.path.abspath(args.out_path))
     os.makedirs(output_parent, exist_ok=True)
-    main(Config(EMB_PATH=args.emb_path, RELATED_PATH=args.related_path, OUT_PATH=args.out_path, SEED_MAX=args.seed_max))
+    main(Config(EMB_PATH=args.emb_path, RELATED_PATH=args.related_path, OUT_PATH=args.out_path,
+                SEED_MAX=args.seed_max, GAP_KEEP_RATIO=args.gap_keep_ratio))

@@ -1,38 +1,146 @@
+# Common legacy defaults remain the fallback for datasets without a profile.
 embedding_size: 64
 p2b_weight: 0.2
 seed: [13]
 learning_rate_scheduler: [0.96, 50]
 learning_rate: 0.001
-reg_weight_1: 1e-05
+reg_weight_1: 1.0e-05
 knn_k: 10
 n_ui_layers: 3
 bm_loss: 0.01
 reg_weight_2: 0.1
-
-# # baby
-#n_layers: 1
-#bm_temp: 0.4
-#um_loss: 0.005
-#um_temp: 0.1
-#vt_loss: 0.01
-
-# # sports
-#n_layers: 1
-#bm_temp: 0.2
-#um_loss: 0.01
-#um_temp: 0.1
-#vt_loss: 0.01
-
-# # clothing
 n_layers: 1
 bm_temp: 0.2
 um_loss: 0.01
 um_temp: 0.2
 vt_loss: 0.1
 
-# # elec
-#n_layers: 1
-#bm_temp: 0.2
-#um_loss: 0.01
-#um_temp: 0.2
-#vt_loss: 0.01
+# Verified single-seed profiles, selected automatically by --dataset.
+# Explicit --config / CLI options override these defaults.
+# gap_keep_ratio records Stage 1 preparation; pass it to stage1_process.py as
+# --gap-keep-ratio. Stage 2 does not regenerate text_feat.npy.
+# Recall targets only select retained exploratory checkpoints; validation
+# Recall@20 still controls early stopping. See docs/VERIFIED_RESULTS.md.
+dataset_overrides:
+  baby:
+    embedding_size: 64
+    n_layers: 1
+    n_ui_layers: 3
+    knn_k: 10
+    p2b_weight: 0.9
+    max_p2b_k: 10
+    bm_loss: 0.01
+    bm_temp: 0.2
+    um_loss: 0.003
+    um_temp: 0.1
+    vt_loss: 0.01
+    reg_weight_1: 1.0e-05
+    reg_weight_2: 0.1
+    learning_rate: 0.001
+    learning_rate_scheduler: [0.96, 50]
+    seed: [42]
+    epochs: 500
+    stopping_step: 60
+    min_epochs: 80
+    train_batch_size: 8192
+    eval_batch_size: 4096
+    learner: "adam"
+    weight_decay: 0.0
+    eval_step: 1
+    training_neg_sample_num: 1
+    use_neg_sampling: true
+    use_full_sampling: false
+    grad_sample_batches: 1
+    metrics: ["Recall", "NDCG", "Precision", "MAP"]
+    topk: [5, 10, 20, 50]
+    valid_metric: "Recall@20"
+    save_recommended_topk: false
+    gap_keep_ratio: 0.2
+    visual_user_graph: "shared_text"
+    explicit_visual_graph: "raw_knn"
+    target_recall10: 0.0702
+    target_recall20: 0.1077
+    run_dir: null
+    checkpoint_dir: "saved/verified"
+
+  sports:
+    embedding_size: 64
+    n_layers: 1
+    n_ui_layers: 3
+    knn_k: 10
+    p2b_weight: 0.4
+    max_p2b_k: 20
+    bm_loss: 0.005
+    bm_temp: 0.2
+    um_loss: 0.01
+    um_temp: 0.15
+    vt_loss: 0.01
+    reg_weight_1: 1.0e-05
+    reg_weight_2: 0.1
+    learning_rate: 0.0007
+    learning_rate_scheduler: [0.96, 50]
+    seed: [999]
+    epochs: 500
+    stopping_step: 60
+    min_epochs: 80
+    train_batch_size: 8192
+    eval_batch_size: 4096
+    learner: "adam"
+    weight_decay: 0.0
+    eval_step: 1
+    training_neg_sample_num: 1
+    use_neg_sampling: true
+    use_full_sampling: false
+    grad_sample_batches: 1
+    metrics: ["Recall", "NDCG", "Precision", "MAP"]
+    topk: [5, 10, 20, 50]
+    valid_metric: "Recall@20"
+    save_recommended_topk: false
+    gap_keep_ratio: 0.4
+    visual_user_graph: "shared_text"
+    explicit_visual_graph: "raw_knn"
+    target_recall10: 0.0821
+    target_recall20: 0.1221
+    run_dir: null
+    checkpoint_dir: "saved/verified"
+
+  clothing:
+    embedding_size: 64
+    n_layers: 1
+    n_ui_layers: 3
+    knn_k: 10
+    p2b_weight: 0.2
+    max_p2b_k: 15
+    bm_loss: 0.01
+    bm_temp: 0.2
+    um_loss: 0.01
+    um_temp: 0.2
+    vt_loss: 0.1
+    reg_weight_1: 1.0e-05
+    reg_weight_2: 0.1
+    learning_rate: 0.001
+    learning_rate_scheduler: [0.96, 50]
+    seed: [13]
+    epochs: 500
+    stopping_step: 60
+    min_epochs: 80
+    train_batch_size: 8192
+    eval_batch_size: 4096
+    learner: "adam"
+    weight_decay: 0.0
+    eval_step: 1
+    training_neg_sample_num: 1
+    use_neg_sampling: true
+    use_full_sampling: false
+    grad_sample_batches: 1
+    metrics: ["Recall", "NDCG", "Precision", "MAP"]
+    topk: [5, 10, 20, 50]
+    valid_metric: "Recall@20"
+    save_recommended_topk: false
+    gap_keep_ratio: 0.4
+    visual_user_graph: "shared_text"
+    explicit_visual_graph: "raw_knn"
+    target_recall10: 0.0738
+    target_recall20: 0.1088
+    run_dir: null
+    checkpoint_dir: "saved/verified"

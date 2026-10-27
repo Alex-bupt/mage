@@ -92,6 +92,20 @@ class MAGE(GeneralRecommender):
 
         self.dataset_path = dataset_path(config)
         self.p2b_weight = float(config['p2b_weight'])
+        max_p2b_k = config['max_p2b_k'] if 'max_p2b_k' in config else 20
+        if isinstance(max_p2b_k, bool) or not isinstance(max_p2b_k, (int, np.integer)) or max_p2b_k < 0:
+            raise ValueError('max_p2b_k must be a non-negative integer')
+        self.max_p2b_k = int(max_p2b_k)
+        self.last_loss_components = {}
+
+        # Independent graph ablations. Defaults retain the deployed model's
+        # operators and parameter initialization; neither option changes data.
+        self.visual_user_graph = config['visual_user_graph'] if 'visual_user_graph' in config else 'shared_text'
+        self.explicit_visual_graph = config['explicit_visual_graph'] if 'explicit_visual_graph' in config else 'raw_knn'
+        if self.visual_user_graph not in ('shared_text', 'own_visual'):
+            raise ValueError('visual_user_graph must be shared_text or own_visual')
+        if self.explicit_visual_graph not in ('raw_knn', 'consensus'):
+            raise ValueError('explicit_visual_graph must be raw_knn or consensus')
 
         self.bilinear_fusion = BiLinearGate(self.embedding_dim)
 
@@ -109,7 +123,7 @@ class MAGE(GeneralRecommender):
         if self.v_feat is not None:
             self.iGUME_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             if os.path.exists(iGUME_adj_file):
-                iGUME_adj = torch.load(iGUME_adj_file)
+                iGUME_adj = torch.load(iGUME_adj_file, map_location='cpu', weights_only=True)
             else:
                 iGUME_adj = build_sim(self.iGUME_embedding.weight.detach())
                 iGUME_adj = build_knn_normalized_graph(iGUME_adj, topk=self.knn_k, is_sparse=self.sparse,
@@ -120,7 +134,7 @@ class MAGE(GeneralRecommender):
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             if os.path.exists(text_adj_file):
-                text_adj = torch.load(text_adj_file)
+                text_adj = torch.load(text_adj_file, map_location='cpu', weights_only=True)
             else:
                 text_adj = build_sim(self.text_embedding.weight.detach())
                 text_adj = build_knn_normalized_graph(text_adj, topk=self.knn_k, is_sparse=self.sparse, norm_type='sym')
@@ -135,6 +149,17 @@ class MAGE(GeneralRecommender):
         print("[Model] Building visual graph (KNN only)...")
         self.ii_adj_visual = self.add_edge(self.inter, p2b_map=None)
 
+        # The paper's visual item stream uses visual/text KNN consensus.
+        # Test only the explicit item operator: extended UI, text, and ID
+        # operators below remain unchanged. Do not add loops or reverse edges.
+        self.explicit_visual_adj = self.iGUME_original_adj
+        if self.explicit_visual_graph == 'consensus':
+            consensus_adj = self.normalize_item_adj(self.ii_adj_visual)
+            self.explicit_visual_adj = self.sparse_mx_to_torch_sparse_tensor(consensus_adj).float().to(self.device)
+            zero_degree = int(np.count_nonzero(np.asarray(self.ii_adj_visual.sum(axis=1)).ravel() == 0))
+            print('[Model Ablation] explicit_visual_graph=consensus; edges={}; zero_out_degree={}/{}'.format(
+                self.ii_adj_visual.nnz, zero_degree, self.n_items))
+
         # 2.2 Text graph: KNN + P2B complement edges
         print("[Model] Building text graph (KNN + P2B)...")
         self.ii_adj_text = self.add_edge(self.inter, self.p2b_map)
@@ -144,16 +169,23 @@ class MAGE(GeneralRecommender):
 
         # 3.1 Visual Graph -> norm_adj_visual
         # get_adj_mat updates self.R from the visual graph, later overwritten by text graph
-        norm_adj_visual_mat = self.get_adj_mat(self.ii_adj_visual.tolil())
+        norm_adj_visual_mat = self.get_adj_mat(self.ii_adj_visual)
         self.norm_adj_visual = self.sparse_mx_to_torch_sparse_tensor(norm_adj_visual_mat).float().to(self.device)
+        visual_ui = self.R if self.visual_user_graph == 'own_visual' else None
 
         # 3.2 Text Graph -> norm_adj_text
         # This call updates self.R using the text graph
-        norm_adj_text_mat = self.get_adj_mat(self.ii_adj_text.tolil())
+        norm_adj_text_mat = self.get_adj_mat(self.ii_adj_text)
         self.norm_adj_text = self.sparse_mx_to_torch_sparse_tensor(norm_adj_text_mat).float().to(self.device)
 
         # 3.3 Create R_tensor using the last updated self.R
         self.R_tensor = self.sparse_mx_to_torch_sparse_tensor(self.R).float().to(self.device)
+        # Isolate the text-degree dependence of visual user-history aggregation.
+        # This changes only the visual explicit UI block, not its edge support.
+        self.visual_R_tensor = self.R_tensor
+        if self.visual_user_graph == 'own_visual':
+            self.visual_R_tensor = self.sparse_mx_to_torch_sparse_tensor(visual_ui).float().to(self.device)
+            print('[Model Ablation] visual_user_graph=own_visual')
 
         # Layers
         self.iGUME_reduce_dim = nn.Linear(self.v_feat.shape[1], self.embedding_dim)
@@ -201,7 +233,6 @@ class MAGE(GeneralRecommender):
         return inter
 
     def add_edge(self, inter, p2b_map=None):
-        MAX_P2B_K = 20
         P2B_WEIGHT = self.p2b_weight
         sim_rows = []
         sim_cols = []
@@ -220,14 +251,14 @@ class MAGE(GeneralRecommender):
                     src_id = int(src_str)
                 except:
                     continue
-                if src_id >= self.n_items: continue
-                current_targets = targets[:MAX_P2B_K]
+                if not 0 <= src_id < self.n_items: continue
+                current_targets = targets[:self.max_p2b_k]
                 for tgt_str in current_targets:
                     try:
                         tgt_id = int(tgt_str)
                     except:
                         continue
-                    if tgt_id >= self.n_items or tgt_id == src_id: continue
+                    if not 0 <= tgt_id < self.n_items or tgt_id == src_id: continue
                     sim_rows.append(src_id)
                     sim_cols.append(tgt_id)
                     sim_values.append(P2B_WEIGHT)
@@ -236,8 +267,8 @@ class MAGE(GeneralRecommender):
         else:
             print("[Model Info] Clean KNN graph built (no P2B injected).")
 
-        sim_rows = torch.tensor(sim_rows)
-        sim_cols = torch.tensor(sim_cols)
+        sim_rows = np.asarray(sim_rows, dtype=np.int64)
+        sim_cols = np.asarray(sim_cols, dtype=np.int64)
         sim_values = np.array(sim_values, dtype=np.float32)
         item_adj = sp.coo_matrix((sim_values, (sim_rows, sim_cols)),
                                  shape=(self.n_items, self.n_items),
@@ -245,36 +276,42 @@ class MAGE(GeneralRecommender):
         return item_adj
 
     def get_adj_mat(self, item_adj):
-        adj_mat = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
-        adj_mat = adj_mat.tolil()
-        R = self.interaction_matrix.tolil()
-        adj_mat[:self.n_users, self.n_users:] = R
-        adj_mat[self.n_users:, :self.n_users] = R.T
-        adj_mat[self.n_users:, self.n_users:] = item_adj
-        adj_mat = adj_mat.todok()
-
-        def normalized_adj_single(adj):
-            rowsum = np.array(adj.sum(1))
-            rowsum[rowsum <= 1e-9] = 1e-9
-            d_inv = np.power(rowsum, -0.5).flatten()
-            d_inv[np.isinf(d_inv)] = 0.
-            d_mat_inv = sp.diags(d_inv)
-            norm_adj = d_mat_inv.dot(adj_mat)
-            norm_adj = norm_adj.dot(d_mat_inv)
-            return norm_adj.tocoo()
-
-        norm_adj_mat = normalized_adj_single(adj_mat)
-        norm_adj_mat = norm_adj_mat.tolil()
-        # Update self.R for explicit propagation (shared)
+        # Block construction avoids the Python-level insertion and conversions of
+        # DOK/LIL while retaining [[0, R], [R.T, item_adj]], including directed II edges.
+        R = self.interaction_matrix.tocsr()
+        adj_mat = sp.bmat([[None, R], [R.T, item_adj]], format='csr', dtype=np.float32)
+        rowsum = np.asarray(adj_mat.sum(axis=1)).ravel()
+        rowsum[rowsum <= 1e-9] = 1e-9
+        d_inv = np.power(rowsum, -0.5)
+        d_inv[np.isinf(d_inv)] = 0.
+        d_mat_inv = sp.diags(d_inv, format='csr')
+        norm_adj_mat = (d_mat_inv @ adj_mat @ d_mat_inv).tocsr()
+        # The text-graph call remains last, so shared explicit propagation still
+        # uses the UI block normalized with the text graph's item degrees.
         self.R = norm_adj_mat[:self.n_users, self.n_users:]
-        return norm_adj_mat.tocsr()
+        return norm_adj_mat
+
+    @staticmethod
+    def normalize_item_adj(item_adj):
+        """Item-only D^-1/2 A D^-1/2, preserving directed consensus edges.
+
+        Zero out-degree nodes receive inverse degree zero, as in the existing
+        KNN normalizer. Interaction degrees are intentionally excluded.
+        """
+        adjacency = item_adj.tocsr().astype(np.float32)
+        degree = np.asarray(adjacency.sum(axis=1)).ravel()
+        inverse_sqrt = np.zeros_like(degree)
+        nonzero = degree > 0
+        inverse_sqrt[nonzero] = np.power(degree[nonzero], -0.5)
+        scale = sp.diags(inverse_sqrt, format='csr')
+        return (scale @ adjacency @ scale).tocsr()
 
     def sparse_mx_to_torch_sparse_tensor(self, sparse_mx):
         sparse_mx = sparse_mx.tocoo().astype(np.float32)
         indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
         values = torch.from_numpy(sparse_mx.data)
         shape = torch.Size(sparse_mx.shape)
-        return torch.sparse.FloatTensor(indices, values, shape)
+        return torch.sparse_coo_tensor(indices, values, shape)
 
     def conv_ui(self, adj, user_embeds, item_embeds):
         ego_embeddings = torch.cat([user_embeds, item_embeds], dim=0)
@@ -311,8 +348,8 @@ class MAGE(GeneralRecommender):
 
         # 3) Visual stream (asymmetric: KNN only)
         # Step 3.1: Explicit II (visual KNN)
-        explicit_iGUME_item = self.conv_ii(self.iGUME_original_adj, iGUME_item_embeds)
-        explicit_iGUME_user = torch.sparse.mm(self.R_tensor, explicit_iGUME_item)
+        explicit_iGUME_item = self.conv_ii(self.explicit_visual_adj, iGUME_item_embeds)
+        explicit_iGUME_user = torch.sparse.mm(self.visual_R_tensor, explicit_iGUME_item)
         explicit_iGUME_embeds = torch.cat([explicit_iGUME_user, explicit_iGUME_item], dim=0)
 
         # Step 3.2: Extended UI (visual graph, no P2B)
@@ -422,6 +459,16 @@ class MAGE(GeneralRecommender):
         reg_loss = reg_loss_1 + reg_loss_2
 
         total_loss = bpr_loss + al_loss + um_loss + reg_loss
+        # Detached values let the trainer sample diagnostics without retaining
+        # the autograd graph or introducing CPU/GPU synchronization each batch.
+        self.last_loss_components = {
+            'bpr': bpr_loss.detach(),
+            'bm': bm_loss.detach(),
+            'um': um_loss.detach(),
+            'vt': vt_loss.detach(),
+            'reg': reg_loss.detach(),
+            'total': total_loss.detach(),
+        }
 
         return total_loss
 

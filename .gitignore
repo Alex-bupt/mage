@@ -7,6 +7,7 @@ venv/
 *.pem
 *.key
 data/
+data_verified/
 log/
 logs/
 saved/
