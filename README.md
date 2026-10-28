@@ -28,7 +28,17 @@ export PYTHONHASHSEED=13
 
 ## Prepare data
 
-**[Download prepared datasets from Google Drive](https://drive.google.com/file/d/1EYtXqrTKnv2WqVvIsBezJ7qLKPnteg4f/view?usp=sharing)** — Baby, Sports, Clothing and Electronics.
+**[Download prepared datasets from Hugging Face](https://huggingface.co/datasets/Alex6657/MAGE)** — Baby, Sports, Clothing and Electronics. The complete archive is also available from [Google Drive](https://drive.google.com/file/d/1EYtXqrTKnv2WqVvIsBezJ7qLKPnteg4f/view?usp=sharing).
+
+The Hugging Face dataset page provides an interaction preview for each dataset. To load the original interaction splits:
+
+```python
+from datasets import load_dataset
+
+dataset = load_dataset("Alex6657/MAGE", "baby")  # baby, sports, clothing, or elec
+```
+
+These tables contain interactions only. For MAGE training, download `archive/MAGE_datasets_2026-10-08.zip` from the dataset page to obtain the feature matrices, ID mappings and relation graphs as well.
 
 `MAGE_datasets_2026-10-08.zip` contains interaction splits, ID mappings, visual features, raw seed text features, expanded text catalogs, offline relation graphs and complementary edges. Its original augmented `text_feat.npy` used gap retention **0.60**. **Run Stage 1 with the configurations below**, which use 0.20 or 0.40.
 
